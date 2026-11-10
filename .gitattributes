@@ -1,0 +1,5 @@
+# The workflow YAML carries embedded shell that runs on Linux runners, and the
+# k8s manifests carry an sh script in ngrok.yaml. Checking either out with CRLF
+# breaks them, so normalise to LF in the repository and on checkout everywhere.
+* text=auto eol=lf
+*.jar binary
