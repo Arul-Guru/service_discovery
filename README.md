@@ -172,6 +172,15 @@ Images are tagged `sha-<12 chars of commit>`, plus `latest` on `main` and semver
 on a `v*` tag. The cluster always runs the immutable sha tag, which is what
 makes `imagePullPolicy: IfNotPresent` safe.
 
+### Before it is configured
+
+Until the secrets and variables below exist, `prepare` skips the stages it
+cannot run and says so — in a `::warning::` and in the run summary — rather
+than failing deep inside a login step. So a fresh clone gets a green
+**build → test → image** run, and **publish** and **deploy** switch on by
+themselves once their configuration is present. Missing Docker Hub
+configuration also skips the deploy, since it has no image to pull.
+
 ### Required repository configuration
 
 Settings → Secrets and variables → Actions.

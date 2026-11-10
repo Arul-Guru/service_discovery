@@ -76,6 +76,13 @@ jobs:
           SKIP_DEPLOY: ${{ inputs.skip_deploy }}
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
         run: |
           set -euo pipefail
 
@@ -87,18 +94,72 @@ jobs:
 
           # Defaults to the Docker Hub account itself, which is the common case
           # for a personal registry namespace.
-          echo "namespace=${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}" >> "$GITHUB_OUTPUT"
+          # The inner :- matters: under `set -u` a bare $DOCKERHUB_USERNAME aborts
+          # the step if the secret is not merely empty but unset.
+          echo "namespace=${DOCKERHUB_NAMESPACE:-${DOCKERHUB_USERNAME:-}}" >> "$GITHUB_OUTPUT"
+
+          # Which stages this run is *configured* for, as opposed to allowed by
+          # the trigger. A fresh clone of this repository has no secrets yet,
+          # and the useful behaviour then is a green build and test with the
+          # later stages skipped and a warning naming what is missing - not a
+          # red run whose log says "Username and password required" six jobs
+          # deep. Nothing is hidden: every skip is announced.
+          missing_publish=""
+          [ -n "${DOCKERHUB_USERNAME:-}" ] || missing_publish="$missing_publish DOCKERHUB_USERNAME"
+          [ -n "${DOCKERHUB_TOKEN:-}" ]    || missing_publish="$missing_publish DOCKERHUB_TOKEN"
+
+          missing_deploy=""
+          [ -n "${GCP_WIF_PROVIDER:-}" ]    || missing_deploy="$missing_deploy GCP_WIF_PROVIDER"
+          [ -n "${GCP_SERVICE_ACCOUNT:-}" ] || missing_deploy="$missing_deploy GCP_SERVICE_ACCOUNT"
+          [ -n "${GCP_PROJECT_ID:-}" ]      || missing_deploy="$missing_deploy GCP_PROJECT_ID"
+          [ -n "${GKE_CLUSTER:-}" ]         || missing_deploy="$missing_deploy GKE_CLUSTER"
+          [ -n "${GKE_LOCATION:-}" ]        || missing_deploy="$missing_deploy GKE_LOCATION"
+          [ -n "${NGROK_AUTHTOKEN:-}" ]     || missing_deploy="$missing_deploy NGROK_AUTHTOKEN"
+
+          publish=true
+          deploy=true
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            publish=false
+            deploy=false
           elif [ "$SKIP_DEPLOY" = "true" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            deploy=false
           fi
+
+          if [ "$publish" = "true" ] && [ -n "$missing_publish" ]; then
+            echo "::warning title=Publish skipped::Not configured for Docker Hub. Missing:${missing_publish}"
+            publish=false
+            # Deploy pulls the published image, so it cannot run either.
+            deploy=false
+          fi
+
+          if [ "$deploy" = "true" ] && [ -n "$missing_deploy" ]; then
+            echo "::warning title=Deploy skipped::Not configured for GKE. Missing:${missing_deploy}"
+            deploy=false
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Run mode"
+            echo ""
+            echo "| Stage | |"
+            echo "|---|---|"
+            echo "| build, test, image | run |"
+            if [ "$publish" = "true" ]; then
+              echo "| publish to Docker Hub | run |"
+            else
+              echo "| publish to Docker Hub | skipped${missing_publish:+ - missing:$missing_publish} |"
+            fi
+            if [ "$deploy" = "true" ]; then
+              echo "| deploy to GKE | run |"
+            else
+              echo "| deploy to GKE | skipped${missing_deploy:+ - missing:$missing_deploy} |"
+            fi
+            echo ""
+            echo "Configuration lives in Settings -> Secrets and variables -> Actions; see README.md."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Stage 1: BUILD
