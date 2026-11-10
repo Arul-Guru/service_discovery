@@ -1,0 +1,8 @@
+# Only the built jar is needed in the build context.
+src/
+.git/
+.github/
+k8s/
+*.md
+target/*
+!target/*.jar

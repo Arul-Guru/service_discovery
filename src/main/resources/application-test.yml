@@ -1,0 +1,5 @@
+# The registry under test must not try to reach a peer or bind the fixed port.
+eureka:
+  client:
+    register-with-eureka: false
+    fetch-registry: false

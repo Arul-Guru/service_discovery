@@ -1,0 +1,10 @@
+# Shared with the rest of the JavaMS platform, so this registry can serve the
+# other services if they are deployed into the same cluster. Applying it is
+# idempotent, and the pipeline applies it first so the Secret check has a
+# namespace to look in.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: javams
+  labels:
+    app.kubernetes.io/part-of: ecommerce-platform

@@ -1,0 +1,25 @@
+# Apply everything by hand with:
+#   kubectl apply -k k8s
+#
+# The pipeline uses this same file, appending an `images:` block so the
+# deployment runs the tag it just published instead of the readable default in
+# deployment.yaml.
+#
+# The ngrok-credentials Secret is NOT here. It holds a real authtoken, so it is
+# created out of band once (see README.md) rather than committed - the same
+# reason the platform's own Secret manifest is excluded from CI.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: javams
+
+resources:
+  - namespace.yaml
+  - service.yaml
+  - deployment.yaml
+  - ngrok.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: ecommerce-platform
+    includeSelectors: false

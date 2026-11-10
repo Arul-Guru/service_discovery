@@ -1,0 +1,42 @@
+server:
+  port: ${SERVER_PORT:8761}
+  shutdown: graceful
+
+spring:
+  application:
+    name: service-discovery
+
+eureka:
+  instance:
+    hostname: ${EUREKA_HOSTNAME:localhost}
+  client:
+    # Standalone single node: the registry is not a client of itself, so it neither
+    # registers nor fetches a peer registry. Peer-aware clustering is FR-SD-06,
+    # deferred to Phase 2.
+    register-with-eureka: false
+    fetch-registry: false
+    service-url:
+      defaultZone: http://${eureka.instance.hostname}:${server.port}/eureka/
+  server:
+    # Self-preservation keeps stale instances in the registry when it suspects a
+    # network partition. Off in development so a stopped service is evicted
+    # promptly (FR-SD-02); it must be ON in production.
+    enable-self-preservation: ${EUREKA_SELF_PRESERVATION:false}
+    eviction-interval-timer-in-ms: 15000
+    response-cache-update-interval-ms: 5000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+    prometheus:
+      enabled: true
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${spring.application.name:-},%X{correlationId:-}] %logger{36} - %msg%n"

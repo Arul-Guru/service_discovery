@@ -1,0 +1,144 @@
+# ==============================================================================
+# Public URL for the registry, via an ngrok agent running inside the cluster.
+#
+# The agent dials out to ngrok's edge and forwards to service-discovery:8761,
+# so nothing needs a public IP, a LoadBalancer, an Ingress controller or a
+# firewall rule. That is the point of using it here: the GKE cluster hands out
+# a reachable https URL without any of that.
+#
+# A separate Deployment, not a sidecar on the registry pod:
+#   - The registry is a single replica by design. A sidecar would tie the
+#     tunnel to its lifecycle, so every registry rollout would drop the tunnel
+#     and - without a reserved domain - change the public URL.
+#   - The tunnel can be restarted, or scaled to zero to revoke access, without
+#     touching the registry.
+#
+# ## This exposes the registry to the open internet
+#
+# Anything that reaches the URL can read every registered instance's host and
+# port, and /eureka/* accepts writes - a stranger can register or de-register
+# instances. Mitigations, in order of effectiveness:
+#   1. Scale this to 0 when you are not using it:
+#        kubectl -n javams scale deploy/ngrok-tunnel --replicas=0
+#   2. Put an ngrok traffic policy in a ConfigMap named ngrok-traffic-policy
+#      (see README.md). The optional mount below picks it up automatically.
+#   3. Keep the URL private. It is not a secret in any real sense, but an
+#      ephemeral ngrok domain is at least unguessable.
+#
+# ## Flags, as of ngrok agent 3.39
+#
+# `--host-header` and `--basic-auth` do NOT exist on this agent - they were
+# removed after v2. Host rewriting is simply not needed: Eureka's dashboard
+# uses relative links and /eureka/* is Host-agnostic. Auth is now a traffic
+# policy action rather than a flag, which is what the optional mount is for.
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ngrok-tunnel
+  namespace: javams
+  labels:
+    app.kubernetes.io/name: ngrok-tunnel
+    app.kubernetes.io/component: tunnel
+    app.kubernetes.io/part-of: ecommerce-platform
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  # Recreate, not RollingUpdate: with a reserved domain two overlapping agents
+  # both claim the same endpoint, and the old one's shutdown can tear down the
+  # endpoint the new one just took. A second of downtime on a dashboard tunnel
+  # is cheaper than that race.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ngrok-tunnel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ngrok-tunnel
+        app.kubernetes.io/component: tunnel
+        app.kubernetes.io/part-of: ecommerce-platform
+    spec:
+      volumes:
+        # Optional on purpose: with no such ConfigMap the file is simply absent
+        # and the script below leaves the flag off. Creating the ConfigMap and
+        # restarting this Deployment is all it takes to turn a policy on.
+        - name: traffic-policy
+          configMap:
+            name: ngrok-traffic-policy
+            optional: true
+      containers:
+        - name: ngrok
+          image: ngrok/ngrok:3
+          imagePullPolicy: IfNotPresent
+          # The image entrypoint is deliberately bypassed. It copies the
+          # authtoken into /var/lib/ngrok/auth-config.yml, which cannot work
+          # under readOnlyRootFilesystem - it fails with "Read-only file
+          # system" and the container dies. The agent reads NGROK_AUTHTOKEN
+          # from the environment on its own, so going straight to the binary
+          # skips that write entirely. `exec` keeps ngrok as PID 1, so it still
+          # gets SIGTERM directly and closes the tunnel cleanly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              [ -n "${NGROK_AUTHTOKEN:-}" ] || {
+                echo "NGROK_AUTHTOKEN is empty - check the ngrok-credentials Secret" >&2
+                exit 1
+              }
+              set -- http "$UPSTREAM" --log=stdout --log-level=info --log-format=logfmt
+              if [ -n "${NGROK_DOMAIN:-}" ]; then
+                echo "using reserved domain ${NGROK_DOMAIN}"
+                set -- "$@" --url="https://${NGROK_DOMAIN}"
+              else
+                echo "no NGROK_DOMAIN set - ngrok will assign an ephemeral URL that changes on restart"
+              fi
+              if [ -f /etc/ngrok/policy.yml ]; then
+                echo "applying traffic policy from the ngrok-traffic-policy ConfigMap"
+                set -- "$@" --traffic-policy-file=/etc/ngrok/policy.yml
+              fi
+              exec ngrok "$@"
+          env:
+            - name: UPSTREAM
+              value: "service-discovery:8761"
+            - name: NGROK_AUTHTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ngrok-credentials
+                  key: authtoken
+            # Optional. Written by the pipeline's deploy job from the
+            # NGROK_DOMAIN repository variable; an absent key resolves to empty
+            # rather than failing the pod, and the script handles empty.
+            - name: NGROK_DOMAIN
+              valueFrom:
+                secretKeyRef:
+                  name: ngrok-credentials
+                  key: domain
+                  optional: true
+          volumeMounts:
+            - name: traffic-policy
+              mountPath: /etc/ngrok
+              readOnly: true
+          # No HTTP probe: the agent's only listener is its inspection API on
+          # 127.0.0.1:4040, which is not reachable from the kubelet. A liveness
+          # probe would have to exec into the pod to be meaningful, and the
+          # agent already exits non-zero on a failed session - which, with the
+          # default restartPolicy, is the restart this would be asking for.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            # The image's own user, uid 1000 / gid 100. Stated explicitly so
+            # runAsNonRoot can be enforced without the kubelet having to
+            # resolve a username from the image.
+            runAsUser: 1000
+            runAsGroup: 100
+            capabilities:
+              drop: ["ALL"]

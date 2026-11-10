@@ -1,0 +1,27 @@
+# ==============================================================================
+# One Service, ClusterIP.
+#
+# The monorepo also carried a NodePort on 30761, so the dashboard could be
+# reached on a local minikube/kind cluster without a port-forward. That is
+# dropped here: on GKE a NodePort means opening a firewall rule to node IPs,
+# and public access is the ngrok tunnel's job (k8s/ngrok.yaml). The registry
+# itself stays cluster-internal, reachable only as service-discovery:8761.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-discovery
+  namespace: javams
+  labels:
+    app.kubernetes.io/name: service-discovery
+    app.kubernetes.io/component: discovery
+    app.kubernetes.io/part-of: ecommerce-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: service-discovery
+  ports:
+    - name: http
+      port: 8761
+      targetPort: http
+      protocol: TCP

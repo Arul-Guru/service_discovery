@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Standalone build for the Eureka registry, extracted from the JavaMS
+  platform-parent reactor.
+
+  In the monorepo this module inherited everything below from
+  com.enterprise.platform:platform-parent. On its own it has to declare it,
+  so the parent is now spring-boot-starter-parent directly and the three
+  things that actually mattered are restated here:
+
+    - the Spring Cloud BOM, for spring-cloud-starter-netflix-eureka-server
+    - java.version 21
+    - spring-boot-starter-test, which the parent contributed to every module
+
+  Two pieces of the parent are deliberately NOT carried over:
+
+    - Lombok. The one source file in this service does not use it.
+    - The surefire spring.cloud.config.enabled=false / on-not-found=ignore
+      properties. Those existed because the business services declare a
+      REQUIRED "configserver:" import that would be unreachable during a test
+      run. The registry has no such import - it is the one service that
+      depends on nothing - so its test needs no such workaround.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.9</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.enterprise.platform</groupId>
+    <artifactId>service-discovery</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>service-discovery</name>
+    <description>Netflix Eureka service registry (C-04)</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 2025.1.4 is the Spring Cloud train built against Spring Boot 4.0.x.
+             Both sides are GA; do not raise one without the other. -->
+        <spring-cloud.version>2025.1.4</spring-cloud.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-netflix-eureka-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

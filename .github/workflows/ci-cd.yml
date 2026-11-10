@@ -1,0 +1,507 @@
+# ==============================================================================
+# build -> test -> image -> publish -> deploy to GKE behind an ngrok tunnel.
+#
+#   build    mvn package, skipping tests. Produces the fat jar.
+#   test     mvn verify. Runs in parallel with build, not after it.
+#   image    Builds the container from the jar build produced, and smoke-checks
+#            it. Publishes to Docker Hub in the same job, since the push has to
+#            come from the machine holding the layers.
+#   deploy   kubectl apply -k against GKE, waits for both rollouts, then
+#            resolves the public ngrok URL and probes it.
+#
+# Pull requests stop after image: a PR proves the code compiles, passes and
+# produces a runnable container, without publishing or touching the cluster.
+#
+# Required repository configuration (Settings -> Secrets and variables ->
+# Actions). See README.md for how to obtain each one.
+#
+#   Secrets   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#             GCP_WIF_PROVIDER, GCP_SERVICE_ACCOUNT
+#             NGROK_AUTHTOKEN
+#   Variables GCP_PROJECT_ID, GKE_CLUSTER, GKE_LOCATION
+#             DOCKERHUB_NAMESPACE (optional, defaults to the Docker Hub user)
+#             NGROK_DOMAIN        (optional, strongly recommended)
+# ==============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: "Build and publish the image but do not touch the cluster"
+        type: boolean
+        default: false
+
+# One run per ref. A later push supersedes an in-flight run, except on main,
+# where cancelling mid-deploy could leave the cluster half rolled out.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "21"
+  JAVA_DISTRIBUTION: temurin
+  # Matches <version> in pom.xml.
+  PROJECT_VERSION: 0.0.1-SNAPSHOT
+  # Not named MAVEN_ARGS: Maven 3.9+ already reads that variable from the
+  # environment on its own, so the flags would be applied twice.
+  MVN_FLAGS: -B -ntp
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Facts the later jobs share, resolved once so the published tag and the
+  # deployed tag cannot disagree.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      namespace: ${{ steps.meta.outputs.namespace }}
+      publish: ${{ steps.meta.outputs.publish }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+    steps:
+      - id: meta
+        name: Resolve image tag and run mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SKIP_DEPLOY: ${{ inputs.skip_deploy }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          # Immutable tag. This is what the cluster runs, which is what makes
+          # imagePullPolicy: IfNotPresent safe in k8s/deployment.yaml: a given
+          # tag always means one image, so a node that already has it is not
+          # holding a stale build.
+          echo "image_tag=sha-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+          # Defaults to the Docker Hub account itself, which is the common case
+          # for a personal registry namespace.
+          echo "namespace=${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          elif [ "$SKIP_DEPLOY" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 1: BUILD
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          # Keyed on pom.xml, and shared with the test job, so neither pays the
+          # Spring Boot 4 / Spring Cloud 2025.1.x download twice.
+          cache: maven
+
+      - name: Package
+        # -DskipTests, not -Dmaven.test.skip: test sources still compile here,
+        # so a test that does not compile fails this job rather than surfacing
+        # as a confusing error in the test job.
+        run: mvn $MVN_FLAGS -DskipTests clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-discovery-jar
+          path: target/service-discovery-${{ env.PROJECT_VERSION }}.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: TEST
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Run tests
+        # The registry is the one service with no external dependency - no
+        # datasource, no configserver: import - so the context test needs
+        # nothing stubbed and no service containers.
+        run: mvn $MVN_FLAGS verify
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 + 4: CREATE IMAGE, then PUBLISH TO DOCKER HUB
+  # ---------------------------------------------------------------------------
+  image:
+    name: Image
+    needs: [prepare, build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: service-discovery-jar
+          # The Dockerfile's default JAR_FILE looks here, matching where
+          # `mvn package` puts it locally.
+          path: target
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Loaded into the local daemon rather than pushed, so the checks
+          # below run against exactly the artifact that gets published.
+          load: true
+          push: false
+          tags: local/service-discovery:${{ needs.prepare.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        # Starts the registry for real and waits for it to report UP. The
+        # registry has no dependencies, so unlike the business services it can
+        # be fully exercised in CI - a context that fails to start, a missing
+        # Eureka bean or a broken jar all surface here rather than as a
+        # CrashLoopBackOff after deploy.
+        #
+        # --read-only with a writable /tmp mirrors the securityContext in
+        # k8s/deployment.yaml. Embedded Tomcat must create a work directory
+        # under java.io.tmpdir before it can bind a port, so this also proves
+        # that the /tmp emptyDir in the manifest is doing its job.
+        env:
+          IMAGE: local/service-discovery:${{ needs.prepare.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          docker run -d --name sd --read-only --tmpfs /tmp \
+            -p 8761:8761 -e EUREKA_HOSTNAME=localhost "$IMAGE"
+
+          for _ in $(seq 1 40); do
+            if curl -fsS http://localhost:8761/actuator/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 3
+          done
+
+          echo "--- health ---"
+          curl -fsS http://localhost:8761/actuator/health | tee /tmp/health.json
+          grep -q '"status":"UP"' /tmp/health.json
+
+          echo "--- readiness ---"
+          curl -fsS http://localhost:8761/actuator/health/readiness >/dev/null
+
+          # The dashboard and the registry API: the two things the ngrok tunnel
+          # exists to expose.
+          echo "--- dashboard + registry API ---"
+          curl -fsS http://localhost:8761/ >/dev/null
+          curl -fsS http://localhost:8761/eureka/apps >/dev/null
+
+          echo "image OK"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs sd || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f sd || true
+
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          # A Docker Hub access token with Read/Write scope, not the password.
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive the published tags
+        if: needs.prepare.outputs.publish == 'true'
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.namespace }}/service-discovery
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.image_tag }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Publish to Docker Hub
+        # Not a rebuild: the layers are already in the buildx cache, so this
+        # resolves to a push.
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          cache-from: type=gha
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: DEPLOY to GKE, exposed through ngrok
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to GKE
+    needs: [prepare, image]
+    if: needs.prepare.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    # Attach required reviewers or a deploy window to this environment in the
+    # repository settings rather than here.
+    environment: production
+    permissions:
+      contents: read
+      # Workload Identity Federation: the job mints a short-lived OIDC token
+      # instead of holding a long-lived service account key.
+      id-token: write
+    outputs:
+      public_url: ${{ steps.url.outputs.public_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          # Without this plugin kubectl fails with
+          # "no Auth Provider found for name gcp".
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          # Region for a regional cluster, zone for a zonal one.
+          location: ${{ vars.GKE_LOCATION }}
+
+      - name: Create the namespace
+        run: kubectl apply -f k8s/namespace.yaml
+
+      - name: Upsert the ngrok credentials
+        # The authtoken is a real credential, so it is never committed - the
+        # Secret is built here from repository configuration instead. The
+        # dry-run/apply pipe is an upsert: `kubectl create secret` alone would
+        # fail on the second run.
+        #
+        # The optional `domain` key is what makes the public URL stable. Set
+        # the NGROK_DOMAIN variable to the static domain on your ngrok
+        # dashboard; leave it unset and ngrok assigns a new random URL every
+        # time the tunnel pod restarts.
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          NGROK_DOMAIN: ${{ vars.NGROK_DOMAIN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
+            echo "::error::Secret NGROK_AUTHTOKEN is not set - the tunnel pod cannot start."
+            echo "Get one from https://dashboard.ngrok.com/get-started/your-authtoken"
+            exit 1
+          fi
+          args="--from-literal=authtoken=${NGROK_AUTHTOKEN}"
+          if [ -n "${NGROK_DOMAIN:-}" ]; then
+            args="$args --from-literal=domain=${NGROK_DOMAIN}"
+            echo "reserved domain: ${NGROK_DOMAIN}"
+          else
+            echo "::warning::NGROK_DOMAIN is not set - the public URL will change on every tunnel restart."
+          fi
+          # shellcheck disable=SC2086
+          kubectl -n javams create secret generic ngrok-credentials $args \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Point the manifest at this commit's image
+        # Appends a kustomize `images:` block rather than editing
+        # deployment.yaml, so the committed manifest keeps a readable default
+        # that works for a manual `kubectl apply -k k8s`. kubectl's built-in
+        # kustomize reads this, so the job needs no extra tooling.
+        env:
+          NAMESPACE: ${{ needs.prepare.outputs.namespace }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "# Appended by .github/workflows/ci-cd.yml - never committed."
+            echo "images:"
+            echo "  - name: javams/service-discovery"
+            echo "    newName: ${NAMESPACE}/service-discovery"
+            echo "    newTag: ${IMAGE_TAG}"
+          } >> k8s/kustomization.yaml
+          kubectl kustomize k8s | grep -E '^\s+image:'
+
+      - name: Show what will change
+        # kubectl diff exits 1 whenever there is a difference, which is the
+        # normal case here, so its status is not a signal.
+        run: kubectl diff -k k8s || true
+
+      - name: Apply manifests
+        # The rolling update is declared, not commanded: k8s/deployment.yaml
+        # already carries maxSurge 1 / maxUnavailable 0, so changing the image
+        # is the whole update.
+        run: kubectl apply -k k8s
+
+      - name: Wait for the rollouts
+        # The registry first: the tunnel forwards to it, and a tunnel that
+        # comes up first would briefly serve 502s.
+        #
+        # 10m against a startupProbe allowing 36 x 5s - a 3 minute probe budget
+        # per pod, plus image pull on a cold node.
+        run: |
+          set -euo pipefail
+          kubectl -n javams rollout status deploy/service-discovery --timeout=10m
+          kubectl -n javams rollout status deploy/ngrok-tunnel --timeout=5m
+
+      - name: Resolve the public URL
+        id: url
+        # Two ways to learn the URL, in order of reliability:
+        #   1. The reserved domain, if one is configured. Known in advance and
+        #      stable across restarts.
+        #   2. The agent's log, which reports the assigned URL on startup. The
+        #      only option for an ephemeral tunnel, and it is parsed rather
+        #      than guessed.
+        env:
+          NGROK_DOMAIN: ${{ vars.NGROK_DOMAIN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NGROK_DOMAIN:-}" ]; then
+            echo "public_url=https://${NGROK_DOMAIN}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The agent logs `url=https://....ngrok-free.app` once the tunnel is
+          # established, which can trail readiness by a moment.
+          url=""
+          for _ in $(seq 1 20); do
+            url=$(kubectl -n javams logs deploy/ngrok-tunnel --tail=200 2>/dev/null \
+                  | grep -oE 'url=https://[A-Za-z0-9.-]+' | tail -1 | cut -d= -f2- || true)
+            [ -n "$url" ] && break
+            sleep 5
+          done
+          if [ -z "$url" ]; then
+            echo "::error::Could not determine the ngrok URL from the agent log."
+            kubectl -n javams logs deploy/ngrok-tunnel --tail=50 || true
+            exit 1
+          fi
+          echo "public_url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Probe the tunnel end to end
+        # Proves the whole path - ngrok edge, agent, Service, pod - not just
+        # that the pods are Running.
+        #
+        # ngrok-skip-browser-warning defeats the free plan's interstitial page,
+        # which would otherwise be served instead of the JSON and make this
+        # look like a failure.
+        env:
+          PUBLIC_URL: ${{ steps.url.outputs.public_url }}
+        run: |
+          set -euo pipefail
+          echo "probing ${PUBLIC_URL}/actuator/health"
+          for attempt in $(seq 1 12); do
+            if body=$(curl -fsS --max-time 20 \
+                        -H 'ngrok-skip-browser-warning: true' \
+                        "${PUBLIC_URL}/actuator/health" 2>/dev/null); then
+              echo "$body"
+              echo "$body" | grep -q '"status":"UP"' && { echo "tunnel OK"; exit 0; }
+            fi
+            echo "attempt ${attempt} not ready yet"
+            sleep 10
+          done
+          echo "::error::The registry is not reachable through ${PUBLIC_URL}"
+          kubectl -n javams logs deploy/ngrok-tunnel --tail=50 || true
+          exit 1
+
+      - name: Roll back on failure
+        if: failure()
+        # revisionHistoryLimit: 3 is what makes undo possible. `rollout undo`
+        # errors on a deployment with no prior revision - a first-ever deploy -
+        # so each is guarded rather than failing the rollback for the other.
+        run: |
+          set -uo pipefail
+          echo "::error::Deploy failed - returning to the previous revision."
+          for d in ngrok-tunnel service-discovery; do
+            if kubectl -n javams rollout undo "deploy/$d" 2>/dev/null; then
+              kubectl -n javams rollout status "deploy/$d" --timeout=5m || true
+            else
+              echo "no previous revision for $d, left as is"
+            fi
+          done
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          echo "::group::pods"
+          kubectl -n javams get pods -o wide
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl -n javams get events --sort-by=.lastTimestamp | tail -30
+          echo "::endgroup::"
+          echo "::group::registry log"
+          kubectl -n javams logs deploy/service-discovery --tail=80 || true
+          echo "::endgroup::"
+          echo "::group::tunnel log"
+          kubectl -n javams logs deploy/ngrok-tunnel --tail=80 || true
+          echo "::endgroup::"
+
+      - name: Summary
+        if: success()
+        env:
+          PUBLIC_URL: ${{ steps.url.outputs.public_url }}
+        run: |
+          {
+            echo "### Registry deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Public URL | [${PUBLIC_URL}](${PUBLIC_URL}) |"
+            echo "| Dashboard | [${PUBLIC_URL}/](${PUBLIC_URL}/) |"
+            echo "| Registry API | \`${PUBLIC_URL}/eureka/apps\` |"
+            echo "| Cluster | \`${{ vars.GKE_CLUSTER }}\` (\`${{ vars.GKE_LOCATION }}\`) |"
+            echo "| Namespace | \`javams\` |"
+            echo "| Image | \`${{ needs.prepare.outputs.namespace }}/service-discovery:${{ needs.prepare.outputs.image_tag }}\` |"
+            echo ""
+            echo "The dashboard and \`/eureka/*\` are reachable by anyone with this URL."
+            echo "To revoke access: \`kubectl -n javams scale deploy/ngrok-tunnel --replicas=0\`"
+          } >> "$GITHUB_STEP_SUMMARY"
