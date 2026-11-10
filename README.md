@@ -200,7 +200,9 @@ The workflow holds no service account key — the deploy job has
 
 ```bash
 PROJECT_ID=<your project id>
-REPO=<owner>/service-discovery
+# Must match this repository exactly: the attribute condition below is what
+# stops any other GitHub repo from impersonating the service account.
+REPO=Arul-Guru/service_discovery
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 
 gcloud iam service-accounts create github-deployer \
